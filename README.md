@@ -29,3 +29,10 @@ data = {
 result = compute_coherence(data)
 print(result)
 ```
+
+## CLI demo
+
+From the project root:
+
+```bash
+python -m hcos.cli -i examples/sample_input.json
