@@ -28,3 +28,4 @@ data = {
 
 result = compute_coherence(data)
 print(result)
+```
