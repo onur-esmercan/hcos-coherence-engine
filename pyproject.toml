@@ -1,1 +1,11 @@
+[project]
+name = "hcos-coherence-engine"
+version = "0.1.0"
+description = "Human Cognitive Operating System — Coherence Engine v0.1"
+authors = [{name="Onur"}]
+readme = "README.md"
+requires-python = ">=3.10"
 
+[project.urls]
+Homepage = "https://github.com/onur-esmercan/hcos-coherence-engine"
+Repository = "https://github.com/onur-esmercan/hcos-coherence-engine"
