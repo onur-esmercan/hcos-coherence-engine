@@ -17,7 +17,7 @@ OUTPUT_FOLDER = "./outputs"
 FINAL_REPORT_FOLDER = "./final_report"
 
 # Model (1.5 Pro - Uzun bağlam için en iyisi)
-MODEL_NAME = "gemini-1.5-pro-latest" 
+MODEL_NAME = "gemini-2.5-pro" 
 
 generation_config = {
     "temperature": 0.1, # Daha tutarlı olması için düşürdük
@@ -117,7 +117,22 @@ def run_agent_with_retry(agent_name, prompt, content, retries=3):
     for attempt in range(retries):
         try:
             response = model.generate_content(content)
-            return json.loads(response.text)
+            cleaned_text = response.text.strip()
+            
+            # Markdown kod bloklarını temizle (```json ... ```)
+            if "```" in cleaned_text:
+                # İlk ve son ``` arasını al
+                # Regex yerine basit split kullanımı daha güvenli olabilir
+                if "```json" in cleaned_text:
+                    cleaned_text = cleaned_text.split("```json")[1]
+                elif "```" in cleaned_text:
+                     cleaned_text = cleaned_text.split("```")[1]
+                
+                if "```" in cleaned_text:
+                    cleaned_text = cleaned_text.split("```")[0]
+            
+            return json.loads(cleaned_text.strip())
+
         except Exception as e:
             logging.warning(f"{agent_name} Hatası (Deneme {attempt + 1}/{retries}): {e}")
             time.sleep(5) # Bekle ve tekrar dene
@@ -134,9 +149,18 @@ def load_json(filepath):
         return json.load(f)
 
 # --- ANA İŞLEM FONKSİYONU ---
-
 def process_file_pipeline(filepath):
     filename = os.path.basename(filepath)
+
+    # Resume özelliği: Dosya zaten varsa atla
+    output_filename = filename.replace('.md', '.json').replace('.txt', '.json')
+    output_path = os.path.join(OUTPUT_FOLDER, output_filename)
+    
+    if os.path.exists(output_path):
+        logging.info(f"  -> {filename} zaten işlenmiş, geçiliyor.")
+        return
+
+
     with open(filepath, 'r', encoding='utf-8') as f:
         raw_text = f.read()
 
@@ -145,35 +169,53 @@ def process_file_pipeline(filepath):
     chunks = smart_split(raw_text)
     miner_results = []
     
-    print(f"  -> Miner çalışıyor ({len(chunks)} parça)...")
+    logging.info(f"  -> Miner: {filename} ({len(chunks)} parça) işleniyor...")
     for i, chunk in enumerate(chunks):
-        # Parça bağlamı ekle
         context_header = f"[PART {i+1}/{len(chunks)}] "
         res = run_agent_with_retry("Miner", MINER_PROMPT, context_header + chunk)
-        if res: miner_results.append(res)
-    
+        if res: 
+            # Bazen miner da liste dönebilir, onu da yönetelim
+            if isinstance(res, list):
+                miner_results.extend(res)
+            elif isinstance(res, dict):
+                miner_results.append(res)
     if not miner_results:
-        print(f"  XX {filename} Miner aşamasında başarısız oldu.")
+        logging.error(f"  XX {filename} Miner aşamasında veri üretemedi.")
         return
         
     # Sonuçları Birleştir
     full_miner_data = merge_miner_results(miner_results)
 
-    # 2. ADIM: VALIDATOR (Tek seferde tüm veriyi değerlendirir)
-    print(f"  -> Validator çalışıyor...")
+    # Helper function: Güvenli Update
+    def safe_update(target_dict, new_data, source_name):
+        if not new_data: return
+        
+        # Eğer liste geldiyse (örn: [{"tech_eval":...}]) içindeki ilk dict'i al
+        if isinstance(new_data, list):
+            logging.warning(f"  !! {source_name} liste döndü, ilk öğe alınıyor.")
+            for item in new_data:
+                if isinstance(item, dict):
+                    target_dict.update(item)
+        # Eğer direkt dict geldiyse
+        elif isinstance(new_data, dict):
+            target_dict.update(new_data)
+        else:
+            logging.error(f"  !! {source_name} bilinmeyen veri tipi döndü: {type(new_data)}")
+
+    # 2. ADIM: VALIDATOR
+    logging.info(f"  -> Validator çalışıyor...")
     validator_data = run_agent_with_retry("Validator", VALIDATOR_PROMPT, json.dumps(full_miner_data))
-    if validator_data: full_miner_data.update(validator_data)
+    safe_update(full_miner_data, validator_data, "Validator")
 
     # 3. ADIM: STRATEGIST
-    print(f"  -> Strategist çalışıyor...")
+    logging.info(f"  -> Strategist çalışıyor...")
     strategist_data = run_agent_with_retry("Strategist", STRATEGIST_PROMPT, json.dumps(full_miner_data))
-    if strategist_data: full_miner_data.update(strategist_data)
+    safe_update(full_miner_data, strategist_data, "Strategist")
 
     # KAYDET
-    output_path = os.path.join(OUTPUT_FOLDER, filename.replace('.md', '.json').replace('.txt', '.json'))
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(full_miner_data, f, indent=2, ensure_ascii=False)
-    print(f"  OK. Kaydedildi: {output_path}")
+    logging.info(f"  ✓ Tamamlandı: {output_filename}")
 
 # --- SENTEZ FONKSİYONU ---
 def run_synthesis():
