@@ -14,7 +14,7 @@ genai.configure(api_key=API_KEY)
 
 INPUT_FOLDER = "./inputs"
 OUTPUT_FOLDER = "./outputs"
-FINAL_REPORT_FOLDER = "./final_reports"
+FINAL_REPORT_FOLDER = "./final_report"
 
 # Model (1.5 Pro - Uzun bağlam için en iyisi)
 MODEL_NAME = "gemini-1.5-pro-latest" 
