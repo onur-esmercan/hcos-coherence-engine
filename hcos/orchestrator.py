@@ -1,11 +1,12 @@
+
 import os
 import json
 import time
 import math
 import re
+import logging
 import google.generativeai as genai
 from dotenv import load_dotenv
-import logging
 
 # --- AYARLAR ---
 load_dotenv()
@@ -14,56 +15,63 @@ genai.configure(api_key=API_KEY)
 
 INPUT_FOLDER = "./inputs"
 OUTPUT_FOLDER = "./outputs"
+DEBUG_FOLDER = "./outputs/debug_logs" # Yeni: Ara kayıtlar buraya
 FINAL_REPORT_FOLDER = "./final_report"
 
-# Model (1.5 Pro - Uzun bağlam için en iyisi)
-MODEL_NAME = "gemini-2.5-pro" 
+MODEL_NAME = "gemini-2.5-pro" # 2.0 veya 1.5 Pro (Erişimin olanı seç)
 
 generation_config = {
-    "temperature": 0.1, # Daha tutarlı olması için düşürdük
+    "temperature": 0.1,
     "top_p": 0.95,
     "max_output_tokens": 8192,
     "response_mime_type": "application/json",
 }
 
+# Klasörleri oluştur
+for folder in [INPUT_FOLDER, OUTPUT_FOLDER, DEBUG_FOLDER, FINAL_REPORT_FOLDER]:
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+# --- LOGGING AYARLARI (Encoding Hatası Çözümü) ---
+# Windows'ta Türkçe karakter hatasını önlemek için encoding='utf-8' şart
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("orchestrator_v2.log"),
+        logging.FileHandler("orchestrator.log", encoding='utf-8'), # DÜZELTME BURADA
         logging.StreamHandler()
     ]
 )
 
-# --- PROMPTLAR ---
+# --- PROMPTLAR (Aynı Kalabilir veya Sertleştirilebilir) ---
 MINER_PROMPT = '''
 GÖREV: Sen "Content Miner V3"sün. Uzun ve karmaşık konuşma loglarını okuyup yapılandırılmış veri çıkarırsın.
-KRİTİK: Eğer girdi [PART X/Y] etiketi taşıyorsa, bu bir bütünün parçasıdır. Önceki parçalardan bağımsız olarak sadece elindeki metindeki veriyi çıkar, birleştirme işini yönetici yapacak.
-ÇIKTI JSON ŞEMASI:{ "extracted_items": [ { "core_idea": "...", "problem": "...", "solution": "...", "code_snippets": ["..."], "user_mood": "..." } ], "trace_log": ["Sayfa 10-15 tarandı", "Kod bloğu tespit edildi"] }
+KRİTİK: Eğer girdi [PART X/Y] etiketi taşıyorsa, bu bir bütünün parçasıdır. Önceki parçalardan bağımsız olarak sadece elindeki metindeki verilerin hepsini çıkar, birleştirme işini yönetici yapacak.
 KURAL: Kod bloklarında değişiklik varsa (önceki versiyona göre) bunu "code_evolution_note" olarak ekle. 
+ÇIKTI JSON ŞEMASI:{ "extracted_items": [ { "core_idea": "...", "problem": "...", "solution": "...", "code_snippets": ["..."], "user_mood": "..." } ], "trace_log": ["..."] }
 '''
 VALIDATOR_PROMPT = '''
-GÖREV: Sen "Tech Validator V3"sün. Miner'dan gelen ham fikir envanterini teknik olarak denetle.ANALİZ:
-Kod-Fikir Tutarlılığı: Fikir "modüler" diyor ama kod "monolitik" ise bunu "High Tech Debt" olarak işaretle.
+GÖREV: Sen "Tech Validator V3"sün. Miner'dan gelen ham fikir envanterini Kod/yayın vs teknik olarak denetle.
+ANALİZ: Kod-Fikir Tutarlılığı: Örneğin Fikir "modüler" diyor ama kod "monolitik" ise bunu "High Tech Debt" olarak belirt, ...
 Kod Kalitesi: Kod blokları modern standartlara (SOLID, Async vb.) uygun mu?
-ÇIKTI: Gelen JSON'a "tech_evaluation": { "integrity_score": 1-100, "refactoring_needs": "...", "architecture_type": "Microservices/Monolith/Serverless" } ekle.
+ÇIKTI: Gelen JSON'a "tech_evaluation": { "integrity_score": 1-100, "refactoring_needs": "...", "architecture_type": "Microservices/Monolith/Serverless/..." } ekle.
 '''
 STRATEGIST_PROMPT = '''
-GÖREV: Sen "GTM Strategist V3"sün. Teknik veriyi al ve [CURRENT_DATE] pazar dinamiklerine göre değerlendir.ANALİZ:
-Bu fikir şu anki AI Agent trendlerine (AutoGPT, LangGraph, CrewAI) rakip mi yoksa tamamlayıcı mı?
-Pazarın bu ürüne şu an ihtiyacı var mı? (Market Readiness).ÇIKTI: Gelen JSON'a "market_intelligence": { "market_fit_score": 1-100, "competitors": [...], "pivot_suggestion": "..." } ekle.
+GÖREV: Sen "GTM Strategist V3"sün. Teknik veriyi al ve [CURRENT_DATE] pazar dinamiklerine göre değerlendir.
+ANALİZ: Bu fikir şu anki market trendlerin içerisinde nasıl konumlanır? Rakip mi, tamamlayıcı mı, pazarına göre zayıf mı?
+Pazarın bu ürüne şu an ihtiyacı var mı? (Market Readiness).
+ÇIKTI: Gelen JSON'a "market_intelligence": { "market_fit_score": 1-100, "competitors": [...], "pivot_suggestion": "..." } ekle.
 '''
 CLUSTERING_PROMPT = '''
-GÖREV: Verilen analiz özetlerini oku ve bunları "Ürün/Konsept" bazında grupla.
-ÇIKTI: { "clusters": { "HCOS_Ecosystem": ["file1.json", "file5.json"], "DNA_Architecture": ["file2.json"] ... } }
+GÖREV: Sen "Tech Validator V3"sün. Verilen analiz özetlerini oku ve bunları "Ürün/Konsept" bazında grupla.
+ÇIKTI: { "clusters": { "...": ["xxx.json", "xxx.html",...], "...": ["....json"] ... } }
 '''
 ARCHITECT_PROMPT = '''
 GÖREV: Sen "Grand Architect"sin. Sana bir konu kümesi (Cluster) ve o kümeye ait tüm analiz dosyaları verildi.
-HEDEF: Bu küme içindeki tüm parça fikirleri birleştirip TEK BİR TUTARLI ÜRÜN MİMARİSİ ortaya çıkarmak.
-YÖNTEM:Çelişkileri gider: Eğer V1.0 ve V3.0 arasında çelişki varsa, V3.0'ı (veya Validator puanı en yüksek olanı) kabul et.
-Nihai Ürünü Tanımla: Bu küme aslında neyi inşa etmeye çalışıyordu?ÇIKTI: Detaylı bir Markdown Raporu ve JSON Mimari Tanımı.
+HEDEF: Bu küme içindeki tüm parça fikirleri birleştirip Ürünlerin "Tutarlı ve Bütünlüklü Mimarisini" kurmak ve "Fikirlerin Evrimini" haritalamak.
+Nihai Ürünü Tanımla: Bu küme aslında neyi inşa etmeye çalışıyordu? Bu kümeden ne çıkarılabilir?
+ÇIKTI: Detaylı bir Markdown Raporu ve Eksikleri giderilmiş kod, servis,... ve whitepaper, GTM strategy, .... çıkar.
 '''
-
 
 # --- YARDIMCI FONKSİYONLAR ---
 
@@ -98,124 +106,117 @@ def smart_split(text, max_chars=30000):
     return chunks
 
 def merge_miner_results(results_list):
-    """Parçalı miner sonuçlarını tek bir JSON'da birleştirir."""
-    master_json = {
-        "packet_id": results_list[0].get("packet_id"),
-        "extracted_items": [],
-        "trace_log": []
-    }
+    """Parçalı sonuçları birleştirir."""
+    master_json = {"packet_id": "MERGED", "extracted_items": [], "trace_log": []}
     for res in results_list:
-        if "extracted_items" in res:
-            master_json["extracted_items"].extend(res["extracted_items"])
-        if "trace_log" in res:
-            master_json["trace_log"].extend(res["trace_log"])
+        if isinstance(res, dict):
+            master_json["extracted_items"].extend(res.get("extracted_items", []))
+            master_json["trace_log"].extend(res.get("trace_log", []))
     return master_json
 
-def run_agent_with_retry(agent_name, prompt, content, retries=3):
-    model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=prompt, generation_config=generation_config)
+def run_agent_with_retry(agent_name, prompt, content, retries=3, use_search=False):
+    tools = [{'google_search': {}}] if use_search else None
     
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME, system_instruction=prompt, generation_config=generation_config)
     for attempt in range(retries):
         try:
             response = model.generate_content(content)
-            cleaned_text = response.text.strip()
+            text = response.text.strip()
             
-            # Markdown kod bloklarını temizle (```json ... ```)
-            if "```" in cleaned_text:
-                # İlk ve son ``` arasını al
-                # Regex yerine basit split kullanımı daha güvenli olabilir
-                if "```json" in cleaned_text:
-                    cleaned_text = cleaned_text.split("```json")[1]
-                elif "```" in cleaned_text:
-                     cleaned_text = cleaned_text.split("```")[1]
-                
-                if "```" in cleaned_text:
-                    cleaned_text = cleaned_text.split("```")[0]
+            # JSON Temizliği
+            if text.startswith("```json"): text = text[7:]
+            if text.endswith("```"): text = text[:-3]
             
-            return json.loads(cleaned_text.strip())
-
+            return json.loads(text)
+            
         except Exception as e:
             logging.warning(f"{agent_name} Hatası (Deneme {attempt + 1}/{retries}): {e}")
-            time.sleep(5) # Bekle ve tekrar dene
-        logging.error(f"{agent_name} tamamen başarısız oldu, içerik işlenemedi.")        
+            time.sleep(10) # Biraz daha uzun bekle
+            
+    logging.error(f"{agent_name} tamamen başarısız oldu.")        
     return None
-def save_json(data, filepath):
-    """JSON verisini dosyaya kaydeder."""
-    with open(filepath, 'w', encoding='utf-8') as f:
+
+def save_debug_json(data, filename, stage):
+    """Ara aşama verisini kaydeder (İzlenebilirlik için)."""
+    debug_name = f"{filename}_{stage}.json"
+    path = os.path.join(DEBUG_FOLDER, debug_name)
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    logging.info(f"  -> Ara Kayıt: {debug_name}")
+def save_json(data, filepath):
+"""JSON verisini dosyaya kaydeder."""
+with open(filepath, 'w', encoding='utf-8') as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
 
 def load_json(filepath):
-    """JSON dosyasını yükler."""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
+"""JSON dosyasını yükler."""
+with open(filepath, 'r', encoding='utf-8') as f:
+    return json.load(f)
 # --- ANA İŞLEM FONKSİYONU ---
+
 def process_file_pipeline(filepath):
     filename = os.path.basename(filepath)
-
-    # Resume özelliği: Dosya zaten varsa atla
-    output_filename = filename.replace('.md', '.json').replace('.txt', '.json')
-    output_path = os.path.join(OUTPUT_FOLDER, output_filename)
+    filename_no_ext = os.path.splitext(filename)[0] # Uzantısız isim
     
+    output_path = os.path.join(OUTPUT_FOLDER, filename.replace('.md', '.json').replace('.txt', '.json'))
     if os.path.exists(output_path):
         logging.info(f"  -> {filename} zaten işlenmiş, geçiliyor.")
         return
 
+    with open(filepath, 'r', encoding='utf-8') as f: raw_text = f.read()
 
-    with open(filepath, 'r', encoding='utf-8') as f:
-        raw_text = f.read()
-
-    # 1. ADIM: MINER (Bölme Mantığı ile)
-    # Eğer dosya çok büyükse veya önceki denemede hata verdiyse bölerek işle
+    # 1. ADIM: MINER
     chunks = smart_split(raw_text)
     miner_results = []
     
-    logging.info(f"  -> Miner: {filename} ({len(chunks)} parça) işleniyor...")
+    logging.info(f"--- {filename} İŞLENİYOR ---")
+    logging.info(f"  -> Miner ({len(chunks)} parça)...")
+    
     for i, chunk in enumerate(chunks):
-        context_header = f"[PART {i+1}/{len(chunks)}] "
-        res = run_agent_with_retry("Miner", MINER_PROMPT, context_header + chunk)
-        if res: 
-            # Bazen miner da liste dönebilir, onu da yönetelim
-            if isinstance(res, list):
-                miner_results.extend(res)
-            elif isinstance(res, dict):
-                miner_results.append(res)
+        res = run_agent_with_retry("Miner", MINER_PROMPT, f"[PART {i+1}/{len(chunks)}] \n {chunk}")
+        if res: miner_results.append(res)
+    
     if not miner_results:
-        logging.error(f"  XX {filename} Miner aşamasında veri üretemedi.")
+        logging.error(f"  XX {filename} Miner başarısız.")
         return
         
-    # Sonuçları Birleştir
     full_miner_data = merge_miner_results(miner_results)
-
-    # Helper function: Güvenli Update
-    def safe_update(target_dict, new_data, source_name):
-        if not new_data: return
-        
-        # Eğer liste geldiyse (örn: [{"tech_eval":...}]) içindeki ilk dict'i al
-        if isinstance(new_data, list):
-            logging.warning(f"  !! {source_name} liste döndü, ilk öğe alınıyor.")
-            for item in new_data:
-                if isinstance(item, dict):
-                    target_dict.update(item)
-        # Eğer direkt dict geldiyse
-        elif isinstance(new_data, dict):
-            target_dict.update(new_data)
-        else:
-            logging.error(f"  !! {source_name} bilinmeyen veri tipi döndü: {type(new_data)}")
+    save_debug_json(full_miner_data, filename_no_ext, "01_Miner") # ARA KAYIT
 
     # 2. ADIM: VALIDATOR
-    logging.info(f"  -> Validator çalışıyor...")
+    logging.info(f"  -> Validator...")
     validator_data = run_agent_with_retry("Validator", VALIDATOR_PROMPT, json.dumps(full_miner_data))
-    safe_update(full_miner_data, validator_data, "Validator")
+    
+    if validator_data:
+        # Liste dönerse ilk elemanı al (Hata önleyici)
+        if isinstance(validator_data, list) and len(validator_data) > 0:
+             full_miner_data.update(validator_data[0])
+        elif isinstance(validator_data, dict):
+             full_miner_data.update(validator_data)
+             
+        save_debug_json(full_miner_data, filename_no_ext, "02_Validator") # ARA KAYIT
+    else:
+        logging.warning("  !! Validator veri döndürmedi, Miner çıktısıyla devam ediliyor.")
 
     # 3. ADIM: STRATEGIST
-    logging.info(f"  -> Strategist çalışıyor...")
-    strategist_data = run_agent_with_retry("Strategist", STRATEGIST_PROMPT, json.dumps(full_miner_data))
-    safe_update(full_miner_data, strategist_data, "Strategist")
+    logging.info(f"  -> Strategist...")
+    strategist_data = run_agent_with_retry("Strategist", STRATEGIST_PROMPT, json.dumps(full_miner_data), use_search=True)
+    
+    if strategist_data:
+        if isinstance(strategist_data, list) and len(strategist_data) > 0:
+             full_miner_data.update(strategist_data[0])
+        elif isinstance(strategist_data, dict):
+             full_miner_data.update(strategist_data)
+             
+        save_debug_json(full_miner_data, filename_no_ext, "03_Strategist") # ARA KAYIT
+    else:
+        logging.warning("  !! Strategist veri döndürmedi.")
 
-    # KAYDET
+    # NİHAİ KAYIT
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(full_miner_data, f, indent=2, ensure_ascii=False)
-    logging.info(f"  ✓ Tamamlandı: {output_filename}")
+    logging.info(f"  ✓ {filename} tamamlandı.")
 
 # --- SENTEZ FONKSİYONU ---
 def run_synthesis():
@@ -278,3 +279,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Sadece process_file_pipeline çağrısını ve klasör taramayı içerir.
+#    pass
